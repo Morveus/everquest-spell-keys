@@ -290,12 +290,17 @@ namespace EqSpells.Core
                         }
 
                         var suspicious = new List<Int32>();
+                        var knownSuspicion = false;
                         for (var i = 0; i < this._gemCount; i++)
                         {
                             var st = this._gems[i];
                             if (st.Norm24 != null)
                             {
-                                if (!Single.IsNaN(scores[i]) && scores[i] < WatchScore) { suspicious.Add(i); }
+                                if (!Single.IsNaN(scores[i]) && scores[i] < WatchScore)
+                                {
+                                    suspicious.Add(i);
+                                    knownSuspicion = true;
+                                }
                                 continue;
                             }
                             // No descriptor: either never identified, or a slot we blanked.
@@ -340,6 +345,16 @@ namespace EqSpells.Core
                         // state of a busy fight - not a sign the geometry moved. Keep
                         // showing what we have and only consider relocating after a long
                         // sustained streak; the Refresh key forces it at any time.
+                        // Blind probes of unknown slots failing to identify is the NORMAL
+                        // state of an empty-but-textured cell (a phantom slot kept by the
+                        // sticky count, scenery under a short bar). Only a KNOWN gem that
+                        // stopped matching is evidence the geometry may be wrong; without
+                        // one, this cycle must not wind the relocate counter.
+                        if (!knownSuspicion)
+                        {
+                            this.LastStatus = "unchanged";
+                            return this.Report(ReadOutcome.NoChange);
+                        }
                         this._unreadableStreak++;
                         if (this._unreadableStreak == 1 || this._unreadableStreak == UnreadableStreakBeforeRelocate / 2)
                         {
@@ -748,16 +763,26 @@ namespace EqSpells.Core
         // How many slots this bar actually has. The fit only proves the first LocateGems
         // cells; walk down from there and keep every cell that reads as part of the bar.
         //
-        // A cell belongs to the bar if it holds an icon - it clears ChangeScore, the same
-        // bar a gem must clear to change the art on a key, which open world does not
-        // (best-match-over-2262-icons hovers near 0.8 on plain background) - or if it is
-        // an empty socket. Measured on a real frame, a socket is simply FLAT: it has no
-        // structure at 24 px, the exact same signature the watch pass already uses for an
-        // emptied slot. Whatever sits below the bar is textured - the spellbook button
-        // scored 0.54 and normalised fine, scenery likewise - so "structured but not an
-        // icon" is where the bar ends. A dark panel docked flush under the bar could
-        // still read as extra flat slots; those keys then sit empty, which is exactly
-        // what a key mapped past the end of the bar should show anyway.
+        // A cell belongs to the bar if it holds an icon or an empty socket. Measured on
+        // real frames: a socket is simply FLAT at 24 px (the watch pass's own signature
+        // for an emptied slot), an icon matches the library, and whatever sits below the
+        // bar is textured without matching - the spellbook button scores ~0.6, scenery
+        // likewise - so "structured but not an icon" is where the bar ends.
+        //
+        // Two hard-won rules make the walk robust:
+        //
+        //  - The icon test uses WatchScore, not ChangeScore. This is a boundary check,
+        //    not an art change: a cell at 0.86 is overwhelmingly an icon (open world
+        //    peaks near 0.8), and demanding 0.90 made the count a coin-toss on a cell
+        //    that measured 0.900 exactly on a clean frame.
+        //
+        //  - The count is STICKY: one ambiguous frame can extend the bar but never
+        //    shorten it. Symphonic Aura pulses the bottom slots forever, and a cell
+        //    caught mid-cast is structured-but-matching-nothing - one such frame used
+        //    to amputate the bar to nine, persist it, and kill keys 10-14 until the
+        //    next lucky recount. The cost: a genuinely shorter bar (another character)
+        //    keeps a few phantom slots whose keys simply stay blank, until a state
+        //    reset re-counts from scratch.
         private Int32 CountGems(FloatImg screen, Grid g, BarFit fit)
         {
             var n = LocateGems;
@@ -768,11 +793,13 @@ namespace EqSpells.Core
                 var p = screen.Patch(g.X, y, g.Size, g.Size, 24);
                 var isFlatSocket = !Matcher.Normalize(p);
                 var isIcon = !isFlatSocket &&
-                    Matcher.ScoreCell(screen, this._lib, g.X, y, g.Size) >= ChangeScore;
-                if (!isIcon && !isFlatSocket) { break; }
+                    Matcher.ScoreCell(screen, this._lib, g.X, y, g.Size) >= WatchScore;
+                var wasBar = i < this._gemCount;
+                if (!isIcon && !isFlatSocket && !wasBar) { break; }
                 n = i + 1;
             }
-            if (n != LocateGems) { this._log?.Info($"Spell bar has {n} slot(s)"); }
+            if (n < this._gemCount) { n = this._gemCount; }
+            if (n != this._gemCount) { this._log?.Info($"Spell bar has {n} slot(s)"); }
             return n;
         }
 
