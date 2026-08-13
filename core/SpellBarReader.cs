@@ -118,10 +118,6 @@ namespace EqSpells.Core
         // the wrong thing, so the refinement is never allowed to wander far from here.
         private Grid _anchorGrid;
         private DateTime _lastLocateFailedUtc = DateTime.MinValue;
-        // Anchor-shift confirmation across full reads: a narrow vote must repeat before
-        // it may move the grid. See ClimbToTop.
-        private Int32 _pendingShiftK;
-        private Int32 _pendingShiftCount;
         private Int32 _unreadableStreak;
 
         public String DataDir { get; }
@@ -384,7 +380,7 @@ namespace EqSpells.Core
                     }
 
                     var screen = FloatImg.FromBitmap(bmp);
-                    var grid = this.LocateBar(screen);
+                    var grid = this.LocateBar(screen, forceFull);
                     if (grid == null)
                     {
                         this._lastLocateFailedUtc = DateTime.UtcNow;
@@ -668,7 +664,14 @@ namespace EqSpells.Core
 
         // --- Locating the bar --------------------------------------------------
 
-        private Grid LocateBar(FloatImg screen)
+        // allowGeometryChange is true only on an explicit Refresh (or with no grid at
+        // all). The bar never moves on its own - only the player moves it, and the
+        // player knows when they did. A week of compounding failures came from letting
+        // automatic relocates re-decide geometry on combat frames: votes on washed
+        // cells, confirmed by periodic aura pulses, each shift re-identifying art at
+        // the wrong position and becoming the next vote's truth. Automatic reads now
+        // revalidate in place or give up; they never search, never shift.
+        private Grid LocateBar(FloatImg screen, Boolean allowGeometryChange)
         {
             // 1. Revalidate the grid we already know, on the run length we last agreed on.
             // The window is +/-4 px: the bar drifts a few pixels over days of play, and
@@ -686,9 +689,17 @@ namespace EqSpells.Core
                     // bar has not moved, so counting only on the band sweep left the
                     // Refresh key unable to pick up slots a stale save undercounted -
                     // the one job it was added for.
-                    var g = this.ClimbToTop(screen, ToGrid(fit));
+                    var g = allowGeometryChange ? this.ClimbToTop(screen, ToGrid(fit)) : ToGrid(fit);
                     this._gemCount = this.CountGems(screen, g, fit);
                     return g;
+                }
+                if (!allowGeometryChange)
+                {
+                    // The bar we knew is not readable where it was. On an automatic read
+                    // that is combat noise until proven otherwise: report unreadable and
+                    // let the back-off retry, rather than sweeping the window and
+                    // gambling the geometry on a bad frame.
+                    return null;
                 }
             }
 
@@ -788,7 +799,7 @@ namespace EqSpells.Core
         // what "this is really the first slot" looks like.
         private Grid ClimbToTop(FloatImg screen, Grid g)
         {
-            var reach = MaxGemCount - LocateGems + 1;
+            var reach = MaxGemCount - 1;
             var bestK = 0;
             var bestScore = -1;
             var currentScore = 0;
@@ -815,38 +826,18 @@ namespace EqSpells.Core
                     bestK = k;
                 }
             }
-            if (bestK == 0)
+            if (bestK == 0) { return g; }
+
+            // Only a clean frame may move the grid: nearly every cell of the winning
+            // alignment must read as bar material. This runs only on an explicit
+            // Refresh, so the player picks the calm moment - and a vote taken over a
+            // chaos frame (scores of 5/14 were observed during heavy combat) is
+            // discarded outright instead of being trusted, margined, or deferred.
+            if (bestScore < this._gemCount - 1)
             {
-                this._pendingShiftK = 0;
+                this._log?.Info($"Anchor vote ignored: only {bestScore}/{this._gemCount} cells readable (shift {bestK} suggested)");
                 return g;
             }
-
-            // A narrow vote must not move the grid on one frame. Something above the bar
-            // reads icon-like, so whenever a cast washes a bottom slot the one-up
-            // alignment edges out the truth by a single point - and the anchor was seen
-            // ping-ponging -1/+1 four times in a minute of active play. Washes move to a
-            // different cell every frame, so a spurious winner cannot repeat, while a
-            // genuinely shifted grid proposes the same correction on every read. Hence:
-            // a landslide (the 13:07 four-slot lock won by a margin of 3+) applies
-            // immediately, a narrow winner must propose the SAME shift on two
-            // consecutive full reads.
-            var margin = bestScore - currentScore;
-            if (margin < 3)
-            {
-                if (this._pendingShiftK == bestK && this._pendingShiftCount >= 1)
-                {
-                    // Confirmed on a second independent frame; fall through and apply.
-                }
-                else
-                {
-                    this._pendingShiftK = bestK;
-                    this._pendingShiftCount = 1;
-                    this._log?.Info($"Bar anchor shift of {bestK} proposed ({bestScore} vs {currentScore} cells); awaiting confirmation");
-                    return g;
-                }
-            }
-            this._pendingShiftK = 0;
-            this._pendingShiftCount = 0;
 
             var fit = Matcher.FindBar(screen, this._lib,
                 g.X - 1, g.X + 1, g.Y0 + bestK * g.Stride - 1, g.Y0 + bestK * g.Stride + 1,
@@ -1153,7 +1144,7 @@ namespace EqSpells.Core
                 if (!this.EnsureLibrary()) { return "library unavailable"; }
                 var screen = FloatImg.FromBitmap(bmp);
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                var grid = this.LocateBar(screen);
+                var grid = this.LocateBar(screen, true);
                 sw.Stop();
                 return grid == null
                     ? $"NOT FOUND in {sw.Elapsed.TotalSeconds:F1} s"
