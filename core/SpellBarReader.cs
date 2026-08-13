@@ -118,6 +118,10 @@ namespace EqSpells.Core
         // the wrong thing, so the refinement is never allowed to wander far from here.
         private Grid _anchorGrid;
         private DateTime _lastLocateFailedUtc = DateTime.MinValue;
+        // Anchor-shift confirmation across full reads: a narrow vote must repeat before
+        // it may move the grid. See ClimbToTop.
+        private Int32 _pendingShiftK;
+        private Int32 _pendingShiftCount;
         private Int32 _unreadableStreak;
 
         public String DataDir { get; }
@@ -787,6 +791,7 @@ namespace EqSpells.Core
             var reach = MaxGemCount - LocateGems + 1;
             var bestK = 0;
             var bestScore = -1;
+            var currentScore = 0;
             var bestAbove = Single.MaxValue;
             for (var k = -reach; k <= reach; k++)
             {
@@ -802,6 +807,7 @@ namespace EqSpells.Core
                 }
                 var yAbove = top - g.Stride;
                 var above = yAbove >= 0 ? Matcher.ScoreCell(screen, this._lib, g.X, yAbove, g.Size) : 0f;
+                if (k == 0) { currentScore = score; }
                 if (score > bestScore || (score == bestScore && above < bestAbove))
                 {
                     bestScore = score;
@@ -809,7 +815,38 @@ namespace EqSpells.Core
                     bestK = k;
                 }
             }
-            if (bestK == 0) { return g; }
+            if (bestK == 0)
+            {
+                this._pendingShiftK = 0;
+                return g;
+            }
+
+            // A narrow vote must not move the grid on one frame. Something above the bar
+            // reads icon-like, so whenever a cast washes a bottom slot the one-up
+            // alignment edges out the truth by a single point - and the anchor was seen
+            // ping-ponging -1/+1 four times in a minute of active play. Washes move to a
+            // different cell every frame, so a spurious winner cannot repeat, while a
+            // genuinely shifted grid proposes the same correction on every read. Hence:
+            // a landslide (the 13:07 four-slot lock won by a margin of 3+) applies
+            // immediately, a narrow winner must propose the SAME shift on two
+            // consecutive full reads.
+            var margin = bestScore - currentScore;
+            if (margin < 3)
+            {
+                if (this._pendingShiftK == bestK && this._pendingShiftCount >= 1)
+                {
+                    // Confirmed on a second independent frame; fall through and apply.
+                }
+                else
+                {
+                    this._pendingShiftK = bestK;
+                    this._pendingShiftCount = 1;
+                    this._log?.Info($"Bar anchor shift of {bestK} proposed ({bestScore} vs {currentScore} cells); awaiting confirmation");
+                    return g;
+                }
+            }
+            this._pendingShiftK = 0;
+            this._pendingShiftCount = 0;
 
             var fit = Matcher.FindBar(screen, this._lib,
                 g.X - 1, g.X + 1, g.Y0 + bestK * g.Stride - 1, g.Y0 + bestK * g.Stride + 1,
