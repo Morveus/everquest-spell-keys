@@ -667,11 +667,14 @@ namespace EqSpells.Core
         private Grid LocateBar(FloatImg screen)
         {
             // 1. Revalidate the grid we already know, on the run length we last agreed on.
+            // The window is +/-4 px: the bar drifts a few pixels over days of play, and
+            // falling through to the band sweep is exactly what a full bar cannot afford
+            // (see ClimbToTop for why).
             if (this._grid != null)
             {
                 var run = Math.Min(this._gemCount, LocateGems);
                 var fit = Matcher.FindBar(screen, this._lib,
-                    this._grid.X - 1, this._grid.X + 1, this._grid.Y0 - 1, this._grid.Y0 + 1,
+                    this._grid.X - 4, this._grid.X + 4, this._grid.Y0 - 4, this._grid.Y0 + 4,
                     this._grid.Size - 1, this._grid.Size + 1, this._grid.Stride - 0.25f, this._grid.Stride + 0.25f, run);
                 if (IsPlausible(fit))
                 {
@@ -679,7 +682,7 @@ namespace EqSpells.Core
                     // bar has not moved, so counting only on the band sweep left the
                     // Refresh key unable to pick up slots a stale save undercounted -
                     // the one job it was added for.
-                    var g = ToGrid(fit);
+                    var g = this.ClimbToTop(screen, ToGrid(fit));
                     this._gemCount = this.CountGems(screen, g, fit);
                     return g;
                 }
@@ -755,9 +758,65 @@ namespace EqSpells.Core
             }
 
             if (!IsPlausible(found)) { return null; }
-            var grid = ToGrid(found);
+            var grid = this.ClimbToTop(screen, ToGrid(found));
             this._gemCount = this.CountGems(screen, grid, found);
             return grid;
+        }
+
+        // A fully-memorised bar is translation-degenerate: a nine-cell fit is equally
+        // perfect starting at slot 1 or slot 5 - fourteen icons offer six flawless
+        // alignments - and the sweep once locked four gems low, then REVALIDATED its own
+        // mistake every cycle, since nine cells from slot 5 are also all icons.
+        //
+        // Anchoring by stepping toward "no icon above" was tried and failed both ways in
+        // one afternoon: a slot mid-pulse under Symphonic Aura reads as non-icon and
+        // stops the climb short, and whatever sits above the bar can read AS an icon and
+        // walks it past the top - the exact failure the original sweep comments warned
+        // about. Single-cell boundary tests lose to single-frame noise, full stop.
+        //
+        // So the anchor is a vote instead. Every vertical alignment within a slot's
+        // reach scores one point per cell that reads as bar material (an icon at
+        // WatchScore, or flat like an empty socket) across the WHOLE bar length. Only
+        // the true alignment keeps all its cells inside the bar; every shifted one
+        // pays for each cell hanging over the spellbook button, scenery, or the buff
+        // stack above - and a couple of pulse-washed cells cost every alignment about
+        // equally. Ties break toward the weakest icon-evidence above the top, which is
+        // what "this is really the first slot" looks like.
+        private Grid ClimbToTop(FloatImg screen, Grid g)
+        {
+            var reach = MaxGemCount - LocateGems + 1;
+            var bestK = 0;
+            var bestScore = -1;
+            var bestAbove = Single.MaxValue;
+            for (var k = -reach; k <= reach; k++)
+            {
+                var top = g.Y0 + k * g.Stride;
+                if (top < 0 || top + (this._gemCount - 1) * g.Stride + g.Size > screen.H) { continue; }
+                var score = 0;
+                for (var i = 0; i < this._gemCount; i++)
+                {
+                    var y = top + i * g.Stride;
+                    var p = screen.Patch(g.X, y, g.Size, g.Size, 24);
+                    if (!Matcher.Normalize(p)) { score++; continue; }
+                    if (Matcher.ScoreCell(screen, this._lib, g.X, y, g.Size) >= WatchScore) { score++; }
+                }
+                var yAbove = top - g.Stride;
+                var above = yAbove >= 0 ? Matcher.ScoreCell(screen, this._lib, g.X, yAbove, g.Size) : 0f;
+                if (score > bestScore || (score == bestScore && above < bestAbove))
+                {
+                    bestScore = score;
+                    bestAbove = above;
+                    bestK = k;
+                }
+            }
+            if (bestK == 0) { return g; }
+
+            var fit = Matcher.FindBar(screen, this._lib,
+                g.X - 1, g.X + 1, g.Y0 + bestK * g.Stride - 1, g.Y0 + bestK * g.Stride + 1,
+                g.Size - 1, g.Size + 1, g.Stride - 0.25f, g.Stride + 0.25f, LocateGems);
+            if (!IsPlausible(fit)) { return g; }
+            this._log?.Info($"Bar anchor corrected by {bestK} slot(s) ({bestScore}/{this._gemCount} cells agree)");
+            return ToGrid(fit);
         }
 
         // How many slots this bar actually has. The fit only proves the first LocateGems
